@@ -7,8 +7,31 @@ const Razorpay = require('razorpay');
 console.log("⚡️ [DEBUG] Razorpay loaded.");
 const cors = require('cors');
 console.log("⚡️ [DEBUG] cors loaded.");
-const serviceAccount = require('./service-account.json');
-console.log("⚡️ [DEBUG] service-account loaded.");
+const path = require('path');
+const fs = require('fs');
+
+let serviceAccount = null;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    try {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    } catch (e) {
+      const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, 'base64').toString('utf8');
+      serviceAccount = JSON.parse(decoded);
+    }
+    console.log("⚡️ [DEBUG] service-account loaded from FIREBASE_SERVICE_ACCOUNT env variable.");
+  } else if (fs.existsSync('/etc/secrets/service-account.json')) {
+    serviceAccount = JSON.parse(fs.readFileSync('/etc/secrets/service-account.json', 'utf8'));
+    console.log("⚡️ [DEBUG] service-account loaded from /etc/secrets/service-account.json.");
+  } else if (fs.existsSync(path.join(__dirname, 'service-account.json'))) {
+    serviceAccount = require('./service-account.json');
+    console.log("⚡️ [DEBUG] service-account loaded from local service-account.json file.");
+  } else {
+    console.warn("⚠️ Warning: service-account.json not found and FIREBASE_SERVICE_ACCOUNT not set in env.");
+  }
+} catch (err) {
+  console.warn("⚠️ Warning: Could not initialize serviceAccount:", err.message);
+}
 
 const app = express();
 app.use(cors());
@@ -65,8 +88,6 @@ app.post('/create-subscription', async (req, res) => {
 });
 
 // ===== PRIVATE LOCAL ADMIN DASHBOARD =====
-const path = require('path');
-const fs = require('fs');
 const REGISTRY_FILE = path.join(__dirname, 'ads_registry.json');
 
 function loadAdsRegistry() {
@@ -893,6 +914,9 @@ app.get('/doctor-ads/metrics', async (req, res) => {
 const crypto = require('crypto');
 
 function createFirebaseCustomToken(uid, serviceAccount) {
+  if (!serviceAccount || !serviceAccount.client_email || !serviceAccount.private_key) {
+    throw new Error("Firebase Service Account credentials not configured on server (set FIREBASE_SERVICE_ACCOUNT in env or add service-account.json).");
+  }
   const header = {
     alg: "RS256",
     typ: "JWT"
