@@ -1342,7 +1342,7 @@ app.post('/api/verify-patient-otp', async (req, res) => {
 });
 
 // ===== GEMINI AI CUSTOMER SUPPORT GATEWAY =====
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyBpMas0co57hHNPQmgdR3eMgeQntlRhU3A';
 
 const MEDKO_SYSTEM_INSTRUCTION = `You are the Medko AI Customer Support Assistant (Assistente Virtual Medko). Medko is a modern clinical practice and patient management platform operating in Brazil, India, the USA, and globally.
 
@@ -1373,9 +1373,10 @@ FOR PATIENTS:
 2. Booking: Book convenient morning or evening slots in a few taps.
 3. Accessing Care: View digital prescriptions, doctor's advice, and medical reports anytime from their mobile device.
 
-GUIDELINES:
+GUIDELINES & ESCALATION RULES:
 - Keep responses friendly, concise (2-4 short paragraphs maximum), and structured with bullet points or emojis when helpful.
-- If a user asks about payment disputes, refund requests, or complex account changes, politely explain the policy and suggest contacting the Medko support team on WhatsApp at +91 99999 99999 or via the in-app WhatsApp button.
+- IF UNABLE TO ANSWER OR RESOLVE AN ISSUE: Whenever you do not know the answer to a question, if an inquiry involves complex account issues, custom billing/refund requests, partnership inquiries, or if the user requests human/direct support, you MUST provide our direct support email: info@medko.app. Tell the user clearly: "Please send an email to info@medko.app and our team will get back to you directly."
+- NEVER invent or output fake phone numbers, placeholder numbers (like +91 99999 99999), or unverified links. For human support, exclusively provide the official email: info@medko.app.
 - Do not provide direct emergency medical diagnosis; if a patient describes severe life-threatening symptoms (chest pain, shortness of breath, severe trauma), instruct them to call local emergency services immediately (SAMU 192 in Brazil, 112 in India, 911 in the US).`;
 
 app.post('/api/ai-support', async (req, res) => {
