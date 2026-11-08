@@ -9,7 +9,12 @@ const cors = require('cors');
 console.log("⚡️ [DEBUG] cors loaded.");
 const path = require('path');
 const fs = require('fs');
-const admin = require('firebase-admin');
+let admin = null;
+try {
+  admin = require('firebase-admin');
+} catch (e) {
+  console.warn("⚠️ firebase-admin module not found yet. Push notifications will run in fallback mode.");
+}
 
 let serviceAccount = null;
 try {
@@ -36,13 +41,13 @@ try {
 
 let adminApp = null;
 try {
-  if (serviceAccount) {
+  if (admin && serviceAccount) {
     adminApp = admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
     });
     console.log("⚡️ [DEBUG] Firebase Admin SDK initialized for Push Notifications.");
   } else {
-    console.warn("⚠️ Firebase Admin SDK not initialized: serviceAccount missing.");
+    console.warn("⚠️ Firebase Admin SDK not initialized: " + (!admin ? "firebase-admin module missing" : "serviceAccount missing"));
   }
 } catch (e) {
   console.warn("⚠️ Firebase Admin SDK init note:", e.message);
@@ -1424,7 +1429,10 @@ app.post('/api/ai-support', async (req, res) => {
     for (const model of modelsToTry) {
       try {
         const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-        const fetchFn = globalThis.fetch || require('node-fetch');
+        let fetchFn = globalThis.fetch;
+        if (!fetchFn) {
+          try { fetchFn = require('node-fetch'); } catch (e) {}
+        }
         const resp = await fetchFn(geminiUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
