@@ -9,6 +9,7 @@ const cors = require('cors');
 console.log("⚡️ [DEBUG] cors loaded.");
 const path = require('path');
 const fs = require('fs');
+const admin = require('firebase-admin');
 
 let serviceAccount = null;
 try {
@@ -33,6 +34,20 @@ try {
   console.warn("⚠️ Warning: Could not initialize serviceAccount:", err.message);
 }
 
+let adminApp = null;
+try {
+  if (serviceAccount) {
+    adminApp = admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log("⚡️ [DEBUG] Firebase Admin SDK initialized for Push Notifications.");
+  } else {
+    console.warn("⚠️ Firebase Admin SDK not initialized: serviceAccount missing.");
+  }
+} catch (e) {
+  console.warn("⚠️ Firebase Admin SDK init note:", e.message);
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -44,6 +59,112 @@ app.get('/', (req, res) => {
 });
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy' });
+});
+
+// ===== PUSH NOTIFICATIONS API =====
+
+// 1. Save or update user FCM/APNs push token in Firestore
+app.post('/api/save-push-token', async (req, res) => {
+  try {
+    const { userId, role, pushToken } = req.body;
+    if (!userId || !pushToken) {
+      return res.status(400).json({ error: "Missing userId or pushToken" });
+    }
+    if (!adminApp) {
+      return res.status(500).json({ error: "Firebase Admin not initialized on server" });
+    }
+    const db = admin.firestore();
+    const collection = role === 'doctor' ? 'doctors' : 'patients';
+    await db.collection(collection).doc(userId).set({
+      pushToken: pushToken,
+      pushTokenUpdatedAt: new Date().toISOString()
+    }, { merge: true });
+
+    console.log(`⚡️ [Push] Token registered in Firestore for ${role} ${userId}`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error saving push token:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 2. Dispatch native push notification to target user
+app.post('/api/send-push', async (req, res) => {
+  try {
+    const { targetUserId, targetRole, title, body, data } = req.body;
+    if (!title || !body) {
+      return res.status(400).json({ error: "Missing title or body" });
+    }
+
+    if (!adminApp) {
+      console.warn("⚠️ Push skipped: Firebase Admin not initialized.");
+      return res.json({ sent: false, reason: "Firebase Admin not initialized" });
+    }
+
+    let token = req.body.token;
+
+    // Look up token in Firestore if not directly provided
+    if (!token && targetUserId) {
+      const db = admin.firestore();
+      let doc = null;
+      if (targetRole) {
+        const col = targetRole === 'doctor' ? 'doctors' : 'patients';
+        doc = await db.collection(col).doc(targetUserId).get();
+      } else {
+        doc = await db.collection('doctors').doc(targetUserId).get();
+        if (!doc.exists) {
+          doc = await db.collection('patients').doc(targetUserId).get();
+        }
+      }
+
+      if (doc && doc.exists) {
+        const u = doc.data();
+        token = u.pushToken || u.fcmToken;
+      }
+    }
+
+    if (!token) {
+      console.log(`ℹ️ [Push] No push token found for user ${targetUserId}. Stored notification only.`);
+      return res.json({ sent: false, reason: "Target user has no push token registered" });
+    }
+
+    const payload = {
+      token: token,
+      notification: {
+        title: title,
+        body: body
+      },
+      data: {
+        ...(data || {}),
+        title: title,
+        body: body,
+        click_action: 'FLUTTER_NOTIFICATION_CLICK'
+      },
+      android: {
+        priority: 'high',
+        notification: {
+          sound: 'default',
+          channelId: 'medko_alerts',
+          priority: 'max'
+        }
+      },
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            badge: 1
+          }
+        }
+      }
+    };
+
+    const response = await admin.messaging().send(payload);
+    console.log(`⚡️ [Push] Notification sent to user ${targetUserId}: ${response}`);
+    res.json({ sent: true, messageId: response });
+  } catch (error) {
+    console.error("⚡️ [Push] Failed to send notification:", error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 let razorpay = null;
@@ -84,6 +205,35 @@ app.post('/create-subscription', async (req, res) => {
   } catch (error) {
     console.error("Razorpay Error:", error);
     res.status(500).json({ error: error.description || "Failed to create subscription" });
+  }
+});
+
+// Create an order supporting all international currencies (USD, BRL, EUR, GBP, INR, etc.)
+app.post('/create-order', async (req, res) => {
+  try {
+    if (!razorpay) {
+      return res.status(500).json({ error: "Razorpay is not initialized on the server" });
+    }
+    const { amount, currency, notes, receipt } = req.body;
+    if (!amount || isNaN(amount)) {
+      return res.status(400).json({ error: "Invalid or missing amount" });
+    }
+
+    const orderCurrency = (currency || 'INR').toUpperCase();
+    const orderOptions = {
+      amount: Math.round(Number(amount)), // smallest subunit (cents, centavos, paise)
+      currency: orderCurrency,
+      receipt: receipt || ('ads_' + Date.now()),
+      notes: notes || {}
+    };
+
+    console.log(`⚡️ [DEBUG] Creating Razorpay Order: ${orderCurrency} ${orderOptions.amount / 100} (${orderOptions.amount} subunits)`);
+    const order = await razorpay.orders.create(orderOptions);
+    console.log(`⚡️ [DEBUG] Razorpay Order created successfully: ${order.id} [${order.currency}]`);
+    res.json(order);
+  } catch (error) {
+    console.error("Razorpay create-order error:", error);
+    res.status(500).json({ error: error.description || error.message || "Failed to create Razorpay order" });
   }
 });
 
@@ -143,7 +293,7 @@ app.get('/api/admin/data', requireLocalAdmin, (req, res) => {
 
       const dailyBudget = Number(c.dailyBudget || c.budget) || 300;
       const weeklySpend = dailyBudget * 7;
-      const weeklyFee = Math.round(dailyBudget * 0.2 * 7); // 20% platform profit
+      const weeklyFee = Math.round(dailyBudget * 0.25 * 7); // 25% platform profit
       const totalWeekly = weeklySpend + weeklyFee;
 
       if (c.enabled) {
@@ -960,6 +1110,47 @@ function createFirebaseCustomToken(uid, serviceAccount) {
 const MSG91_AUTH_KEY = process.env.MSG91_AUTH_KEY;
 const MSG91_WIDGET_ID = process.env.MSG91_WIDGET_ID;
 
+const https = require('https');
+const msg91Agent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  timeout: 30000,
+  keepAliveMsecs: 60000
+});
+
+function postMSG91(urlPath, body) {
+  return new Promise((resolve, reject) => {
+    const postData = JSON.stringify(body);
+    const req = https.request({
+      hostname: 'api.msg91.com',
+      port: 443,
+      path: urlPath,
+      method: 'POST',
+      agent: msg91Agent,
+      headers: {
+        'authkey': MSG91_AUTH_KEY,
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(postData),
+        'connection': 'keep-alive'
+      }
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          resolve({ error: 'Invalid JSON from MSG91', raw: data });
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
 // Helper: Normalize international phone with country code into clean digits
 function extractCleanPhone(phone, countryCode, fullPhone) {
   let clean = (fullPhone || phone || '').replace(/\D/g, '');
@@ -992,19 +1183,11 @@ app.post('/api/send-doctor-otp', async (req, res) => {
       });
     }
 
-    const response = await fetch('https://api.msg91.com/api/v5/widget/sendOtp', {
-      method: 'POST',
-      headers: {
-        'authkey': MSG91_AUTH_KEY,
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify({
-        widgetId: MSG91_WIDGET_ID,
-        identifier: cleanPhone
-      })
+    const data = await postMSG91('/api/v5/widget/sendOtp', {
+      widgetId: MSG91_WIDGET_ID,
+      identifier: cleanPhone
     });
 
-    const data = await response.json();
     console.log("⚡️ [DEBUG] MSG91 Doctor Send OTP response:", data);
 
     if (data.type === 'success' || data.reqId || data.message) {
@@ -1043,20 +1226,12 @@ app.post('/api/verify-doctor-otp', async (req, res) => {
         return res.status(500).json({ error: "MSG91 Credentials not configured" });
       }
 
-      const response = await fetch('https://api.msg91.com/api/v5/widget/verifyOtp', {
-        method: 'POST',
-        headers: {
-          'authkey': MSG91_AUTH_KEY,
-          'content-type': 'application/json'
-        },
-        body: JSON.stringify({
-          widgetId: MSG91_WIDGET_ID,
-          reqId: reqId,
-          otp: otp
-        })
+      const data = await postMSG91('/api/v5/widget/verifyOtp', {
+        widgetId: MSG91_WIDGET_ID,
+        reqId: reqId,
+        otp: otp
       });
 
-      const data = await response.json();
       console.log("⚡️ [DEBUG] MSG91 Doctor Verify OTP response:", data);
 
       if (data.type === 'success' || data.status === 'success') {
@@ -1103,19 +1278,11 @@ app.post('/api/send-patient-otp', async (req, res) => {
       });
     }
 
-    const response = await fetch('https://api.msg91.com/api/v5/widget/sendOtp', {
-      method: 'POST',
-      headers: {
-        'authkey': MSG91_AUTH_KEY,
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify({
-        widgetId: MSG91_WIDGET_ID,
-        identifier: cleanPhone
-      })
+    const data = await postMSG91('/api/v5/widget/sendOtp', {
+      widgetId: MSG91_WIDGET_ID,
+      identifier: cleanPhone
     });
 
-    const data = await response.json();
     console.log("⚡️ [DEBUG] MSG91 Send OTP response:", data);
 
     if (data.type === 'success' || data.reqId || data.message) {
@@ -1150,20 +1317,12 @@ app.post('/api/verify-patient-otp', async (req, res) => {
       return res.status(500).json({ error: "MSG91 Credentials not configured" });
     }
 
-    const response = await fetch('https://api.msg91.com/api/v5/widget/verifyOtp', {
-      method: 'POST',
-      headers: {
-        'authkey': MSG91_AUTH_KEY,
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify({
-        widgetId: MSG91_WIDGET_ID,
-        reqId: reqId,
-        otp: otp
-      })
+    const data = await postMSG91('/api/v5/widget/verifyOtp', {
+      widgetId: MSG91_WIDGET_ID,
+      reqId: reqId,
+      otp: otp
     });
 
-    const data = await response.json();
     console.log("⚡️ [DEBUG] MSG91 Verify OTP response:", data);
 
     if (data.type === 'success' || data.status === 'success') {
@@ -1173,6 +1332,127 @@ app.post('/api/verify-patient-otp', async (req, res) => {
     }
   } catch (error) {
     console.error("MSG91 Verify OTP Error:", error);
+    res.status(500).json({ error: error.message || "Internal server error" });
+  }
+});
+
+// ===== GEMINI AI CUSTOMER SUPPORT GATEWAY =====
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
+const MEDKO_SYSTEM_INSTRUCTION = `You are the Medko AI Customer Support Assistant (Assistente Virtual Medko). Medko is a modern clinical practice and patient management platform operating in Brazil, India, the USA, and globally.
+
+STRICT DOMAIN RESTRICTION (CRITICAL RULE):
+- You are EXCLUSIVELY a customer support assistant for the MEDKO application and clinic services.
+- You must ONLY answer questions directly related to Medko: features, appointments, digital prescriptions, patient queue, medical records, Google Call Ads on Medko, subscriptions, and clinic support.
+- If a user asks about ANY unrelated topic (e.g. general trivia, politics, sports, coding, math, recipes, homework, stories, jokes, weather, or general knowledge), you MUST POLITELY REFUSE and steer them back to Medko.
+- Refusal examples:
+  - In Portuguese: "Desculpe, sou o Assistente de Suporte exclusivo da Medko. Só posso ajudar com dúvidas sobre o aplicativo Medko, consultas, receitas digitais e serviços da sua clínica. Como posso te ajudar com o Medko hoje?"
+  - In English: "I apologize, but I am the dedicated Medko Support Assistant. I can only assist with questions regarding the Medko app, appointments, digital prescriptions, clinic management, and account support. How can I help you with Medko today?"
+  - In Spanish: "Disculpe, soy el Asistente de Soporte exclusivo de Medko. Solo puedo ayudarle con consultas sobre la aplicación Medko, citas y recetas. ¿En qué puedo ayudarle con Medko hoy?"
+  - In Hindi: "क्षमा करें, मैं केवल मेडको (Medko) ऐप और क्लिनिक सेवाओं से संबंधित प्रश्नों में ही आपकी सहायता कर सकता हूं।"
+- NEVER break character or roleplay as a general AI.
+
+YOUR ROLE:
+- Assist doctors and patients warmly, professionally, and concisely in the EXACT LANGUAGE they speak to you (Portuguese for Brazil/Portugal, Spanish for Latin America/Spain, Hindi for India, or English).
+- Answer questions accurately based on Medko's core features:
+
+FOR DOCTORS:
+1. Digital Prescriptions: Easily type diagnoses and select medicines with automatic dosage templates; generate official PDF prescriptions with digital signature & stamp; 1-click share to patient's WhatsApp.
+2. Appointments & Queue: Real-time patient queue ("Waiting", "Completed", "No-show"); 1-click notification when doctor is ready; 1-click WhatsApp appointment reminders to reduce no-shows.
+3. Patient Records: Digital medical history, uploaded lab reports, diagnosis archives.
+4. Google Call Ads: Automated patient acquisition in the doctor's city. Set daily budget in local currency (R$ in Brazil, ₹ in India, $ in US). Billed weekly via Razorpay with a 25% platform management fee. Pause or resume anytime.
+5. Subscription: Full access to all features. 1-week trial (R$ 5 in Brazil, ₹10 in India), then auto-renews at R$ 49/month (Brazil) or ₹599/month (India).
+
+FOR PATIENTS:
+1. Finding Doctors: Search verified doctors by specialization, city, and consultation fee.
+2. Booking: Book convenient morning or evening slots in a few taps.
+3. Accessing Care: View digital prescriptions, doctor's advice, and medical reports anytime from their mobile device.
+
+GUIDELINES:
+- Keep responses friendly, concise (2-4 short paragraphs maximum), and structured with bullet points or emojis when helpful.
+- If a user asks about payment disputes, refund requests, or complex account changes, politely explain the policy and suggest contacting the Medko support team on WhatsApp at +91 99999 99999 or via the in-app WhatsApp button.
+- Do not provide direct emergency medical diagnosis; if a patient describes severe life-threatening symptoms (chest pain, shortness of breath, severe trauma), instruct them to call local emergency services immediately (SAMU 192 in Brazil, 112 in India, 911 in the US).`;
+
+app.post('/api/ai-support', async (req, res) => {
+  try {
+    const { message, history, userRole, userName, lang } = req.body;
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: "Message is required" });
+    }
+
+    const apiKey = GEMINI_API_KEY || process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "Gemini API key not configured on server" });
+    }
+
+    // Prepare contents array with conversation history
+    const contents = [];
+
+    if (history && Array.isArray(history)) {
+      history.slice(-8).forEach(h => {
+        if (h.text) {
+          contents.push({
+            role: h.sender === 'user' ? 'user' : 'model',
+            parts: [{ text: h.text }]
+          });
+        }
+      });
+    }
+
+    // Current message with user role context
+    const userContext = `[Context: User is ${userName || 'User'} (${userRole || 'patient'}), Preferred App Language: ${lang || 'en'}]\n${message}`;
+    contents.push({
+      role: 'user',
+      parts: [{ text: userContext }]
+    });
+
+    const payload = {
+      system_instruction: {
+        parts: [{ text: MEDKO_SYSTEM_INSTRUCTION }]
+      },
+      contents: contents,
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 600
+      }
+    };
+
+    const modelsToTry = ['gemini-3.8-flash', 'gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-flash-latest'];
+    let replyText = null;
+    let lastError = null;
+
+    for (const model of modelsToTry) {
+      try {
+        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+        const fetchFn = globalThis.fetch || require('node-fetch');
+        const resp = await fetchFn(geminiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await resp.json();
+        if (data.candidates && data.candidates[0]?.content?.parts?.[0]?.text) {
+          replyText = data.candidates[0].content.parts[0].text;
+          break;
+        } else if (data.error) {
+          lastError = data.error.message;
+        }
+      } catch (err) {
+        lastError = err.message;
+      }
+    }
+
+    if (!replyText) {
+      console.error("Gemini AI Support Error:", lastError);
+      return res.status(500).json({ 
+        error: "Failed to generate AI response: " + (lastError || "Unknown error") 
+      });
+    }
+
+    res.json({ reply: replyText });
+  } catch (error) {
+    console.error("AI Support endpoint exception:", error);
     res.status(500).json({ error: error.message || "Internal server error" });
   }
 });
