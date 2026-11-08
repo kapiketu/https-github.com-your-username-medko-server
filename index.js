@@ -264,6 +264,272 @@ function saveAdsRegistry(list) {
   }
 }
 
+const LEADS_FILE = path.join(__dirname, 'expert_leads.json');
+
+function loadExpertLeads() {
+  if (fs.existsSync(LEADS_FILE)) {
+    try {
+      return JSON.parse(fs.readFileSync(LEADS_FILE, 'utf8'));
+    } catch (e) {
+      console.error("Error reading expert leads:", e);
+    }
+  }
+  return [];
+}
+
+function saveExpertLead(lead) {
+  try {
+    const list = loadExpertLeads();
+    list.unshift(lead);
+    fs.writeFileSync(LEADS_FILE, JSON.stringify(list, null, 2), 'utf8');
+  } catch (e) {
+    console.error("Error saving expert lead:", e);
+  }
+}
+
+async function sendExpertLeadEmail(lead) {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    console.log("ℹ️ [Resend Note] RESEND_API_KEY not configured in .env yet. Lead saved locally and in Firestore.");
+    return false;
+  }
+
+  const { doctorName, email, whatsapp, city, specialty, budgetTier, lang, timestamp } = lead;
+
+  const htmlBody = `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #E2E8F0; border-radius: 12px; background: #FFFFFF;">
+      <div style="background: #EFF6FF; padding: 16px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #BFDBFE;">
+        <h2 style="margin: 0; color: #1E3A8A; font-size: 1.25rem;">New Google Ads Expert Setup Request</h2>
+        <p style="margin: 4px 0 0; color: #2563EB; font-size: 0.88rem;">A doctor has requested assisted campaign setup</p>
+      </div>
+
+      <table style="width: 100%; border-collapse: collapse; font-size: 0.95rem; line-height: 1.6; margin-bottom: 24px;">
+        <tr style="border-bottom: 1px solid #F1F5F9;">
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600; width: 140px;">Doctor Name:</td>
+          <td style="padding: 10px 0; color: #0F172A; font-weight: 700;">Dr. ${doctorName}</td>
+        </tr>
+        <tr style="border-bottom: 1px solid #F1F5F9;">
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600;">Doctor Email:</td>
+          <td style="padding: 10px 0; color: #2563EB; font-weight: 700;"><a href="mailto:${email}" style="color: #2563EB;">${email}</a></td>
+        </tr>
+        <tr style="border-bottom: 1px solid #F1F5F9;">
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600;">WhatsApp (Opt):</td>
+          <td style="padding: 10px 0; color: #0F172A;">${whatsapp || 'Not provided'}</td>
+        </tr>
+        <tr style="border-bottom: 1px solid #F1F5F9;">
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600;">Specialty / Focus:</td>
+          <td style="padding: 10px 0; color: #0F172A; font-weight: 600;">${specialty || 'General Consultation'}</td>
+        </tr>
+        <tr style="border-bottom: 1px solid #F1F5F9;">
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600;">Target City / Area:</td>
+          <td style="padding: 10px 0; color: #0F172A; font-weight: 600;">${city}</td>
+        </tr>
+        <tr style="border-bottom: 1px solid #F1F5F9;">
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600;">Preferred Budget:</td>
+          <td style="padding: 10px 0; color: #16A34A; font-weight: 700;">${budgetTier || 'Standard Growth'}</td>
+        </tr>
+        <tr>
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600;">Doctor Language:</td>
+          <td style="padding: 10px 0; color: #0F172A; text-transform: uppercase;">${lang || 'en'}</td>
+        </tr>
+      </table>
+
+      <div style="background: #F8FAFC; border: 1px dashed #CBD5E1; border-radius: 10px; padding: 16px; text-align: center;">
+        <p style="margin: 0 0 12px; font-size: 0.85rem; color: #475569;">Click below to reply directly to Dr. ${doctorName} with the campaign procedure:</p>
+        <a href="mailto:${email}?subject=${encodeURIComponent('Medko: Your Google Ads Clinic Campaign Strategy')}" style="background: #2563EB; color: #FFFFFF; text-decoration: none; font-weight: 700; padding: 10px 20px; border-radius: 8px; display: inline-block; font-size: 0.9rem;">
+          Reply to Dr. ${doctorName}
+        </a>
+      </div>
+    </div>
+  `;
+
+  try {
+    let fetchFn = globalThis.fetch;
+    if (!fetchFn) {
+      try { fetchFn = require('node-fetch'); } catch (e) {}
+    }
+
+    const targetRecipient = process.env.ADMIN_ALERT_EMAIL || 'info@medko.app';
+    const fallbackRecipient = 'bhagat.kapil1991@gmail.com';
+
+    let res = await fetchFn('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: 'Medko Ads Concierge <onboarding@resend.dev>',
+        to: [targetRecipient],
+        reply_to: email,
+        subject: `[New Ad Lead] Dr. ${doctorName} (${city}) - ${specialty}`,
+        html: htmlBody
+      })
+    });
+
+    let data = await res.json();
+
+    // If unverified domain restriction applies, route directly to account owner email
+    if (res.status === 403 && data && data.message && data.message.includes('bhagat.kapil1991@gmail.com')) {
+      console.log(`ℹ️ [Resend Note] Routing alert to verified account owner email (${fallbackRecipient})...`);
+      res = await fetchFn('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          from: 'Medko Ads Concierge <onboarding@resend.dev>',
+          to: [fallbackRecipient],
+          reply_to: email,
+          subject: `[New Ad Lead] Dr. ${doctorName} (${city}) - ${specialty}`,
+          html: htmlBody
+        })
+      });
+      data = await res.json();
+    }
+
+    console.log("⚡️ [Resend Email Notification dispatched]:", data);
+    return true;
+  } catch (err) {
+    console.error("Resend delivery warning:", err.message);
+    return false;
+  }
+}
+
+const ISSUES_FILE = path.join(__dirname, 'issue_reports.json');
+
+function loadIssueReports() {
+  if (fs.existsSync(ISSUES_FILE)) {
+    try {
+      return JSON.parse(fs.readFileSync(ISSUES_FILE, 'utf8'));
+    } catch (e) {
+      console.error("Error reading issue reports:", e);
+    }
+  }
+  return [];
+}
+
+function saveIssueReport(report) {
+  try {
+    const list = loadIssueReports();
+    list.unshift(report);
+    fs.writeFileSync(ISSUES_FILE, JSON.stringify(list, null, 2), 'utf8');
+  } catch (e) {
+    console.error("Error saving issue report:", e);
+  }
+}
+
+async function sendIssueReportEmail(report) {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    console.log("ℹ️ [Resend Note] RESEND_API_KEY not configured. Issue report saved locally and in Firestore.");
+    return false;
+  }
+
+  const { userName, userRole, category, description, email, phone, lang, platform, createdAt } = report;
+
+  const htmlBody = `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #E2E8F0; border-radius: 12px; background: #FFFFFF;">
+      <div style="background: #FEF3C7; padding: 16px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #FDE68A;">
+        <h2 style="margin: 0; color: #92400E; font-size: 1.25rem;">New User Issue / Support Report</h2>
+        <p style="margin: 4px 0 0; color: #B45309; font-size: 0.88rem;">Category: <strong>${category || 'General'}</strong> &bull; From: <strong>${userName || 'User'}</strong> (${userRole || 'User'})</p>
+      </div>
+
+      <div style="background: #FFFBEB; border-left: 4px solid #D97706; padding: 14px 16px; margin-bottom: 20px; border-radius: 4px;">
+        <div style="font-weight: 700; color: #78350F; font-size: 0.85rem; text-transform: uppercase; margin-bottom: 4px;">Issue Description:</div>
+        <div style="color: #1F2937; font-size: 0.95rem; line-height: 1.5; white-space: pre-wrap;">${description}</div>
+      </div>
+
+      <table style="width: 100%; border-collapse: collapse; font-size: 0.92rem; line-height: 1.6; margin-bottom: 24px;">
+        <tr style="border-bottom: 1px solid #F1F5F9;">
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600; width: 140px;">Reporter:</td>
+          <td style="padding: 10px 0; color: #0F172A; font-weight: 700;">${userName} (${userRole})</td>
+        </tr>
+        <tr style="border-bottom: 1px solid #F1F5F9;">
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600;">Email:</td>
+          <td style="padding: 10px 0; color: #2563EB; font-weight: 700;"><a href="mailto:${email}" style="color: #2563EB;">${email}</a></td>
+        </tr>
+        <tr style="border-bottom: 1px solid #F1F5F9;">
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600;">Phone:</td>
+          <td style="padding: 10px 0; color: #0F172A;">${phone || 'Not provided'}</td>
+        </tr>
+        <tr style="border-bottom: 1px solid #F1F5F9;">
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600;">Platform / OS:</td>
+          <td style="padding: 10px 0; color: #0F172A;">${platform || 'Web App'}</td>
+        </tr>
+        <tr style="border-bottom: 1px solid #F1F5F9;">
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600;">Language:</td>
+          <td style="padding: 10px 0; color: #0F172A; text-transform: uppercase;">${lang || 'en'}</td>
+        </tr>
+        <tr>
+          <td style="padding: 10px 0; color: #64748B; font-weight: 600;">Reported At:</td>
+          <td style="padding: 10px 0; color: #64748B;">${createdAt || new Date().toISOString()}</td>
+        </tr>
+      </table>
+
+      <div style="background: #F8FAFC; border: 1px dashed #CBD5E1; border-radius: 10px; padding: 16px; text-align: center;">
+        <p style="margin: 0 0 12px; font-size: 0.85rem; color: #475569;">Click below to reply directly to ${userName}:</p>
+        <a href="mailto:${email}?subject=${encodeURIComponent('Medko Support: Regarding your issue report')}" style="background: #D97706; color: #FFFFFF; text-decoration: none; font-weight: 700; padding: 10px 20px; border-radius: 8px; display: inline-block; font-size: 0.9rem;">
+          Reply to ${userName}
+        </a>
+      </div>
+    </div>
+  `;
+
+  try {
+    let fetchFn = globalThis.fetch;
+    if (!fetchFn) {
+      try { fetchFn = require('node-fetch'); } catch (e) {}
+    }
+
+    const targetRecipient = process.env.ADMIN_ALERT_EMAIL || 'info@medko.app';
+    const fallbackRecipient = 'bhagat.kapil1991@gmail.com';
+
+    let res = await fetchFn('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: 'Medko Support <onboarding@resend.dev>',
+        to: [targetRecipient],
+        reply_to: email,
+        subject: `[Medko Issue Report] ${category}: ${userName} (${userRole})`,
+        html: htmlBody
+      })
+    });
+
+    let data = await res.json();
+
+    if (res.status === 403 && data && data.message && data.message.includes('bhagat.kapil1991@gmail.com')) {
+      console.log(`ℹ️ [Resend Note] Routing issue report alert to verified account owner email (${fallbackRecipient})...`);
+      res = await fetchFn('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          from: 'Medko Support <onboarding@resend.dev>',
+          to: [fallbackRecipient],
+          reply_to: email,
+          subject: `[Medko Issue Report] ${category}: ${userName} (${userRole})`,
+          html: htmlBody
+        })
+      });
+      data = await res.json();
+    }
+
+    console.log("⚡️ [Resend Issue Report Email dispatched]:", data);
+    return true;
+  } catch (err) {
+    console.error("Resend delivery warning for issue report:", err.message);
+    return false;
+  }
+}
+
 function requireLocalAdmin(req, res, next) {
   const ip = req.ip || req.connection?.remoteAddress || '';
   const host = req.headers.host || '';
@@ -332,7 +598,9 @@ app.get('/api/admin/data', requireLocalAdmin, (req, res) => {
       weeklyPlatformFee,
       weeklyTotalBilled,
       countries,
-      campaigns
+      campaigns,
+      expertLeads: loadExpertLeads(),
+      issueReports: loadIssueReports()
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1462,6 +1730,98 @@ app.post('/api/ai-support', async (req, res) => {
     res.json({ reply: replyText });
   } catch (error) {
     console.error("AI Support endpoint exception:", error);
+    res.status(500).json({ error: error.message || "Internal server error" });
+  }
+});
+
+// ===== EXPERT AD SETUP LEAD ENDPOINT =====
+app.post('/api/expert-ad-request', async (req, res) => {
+  try {
+    const { doctorId, doctorName, email, whatsapp, city, specialty, budgetTier, lang, timestamp } = req.body;
+    const leadRecord = {
+      doctorId: doctorId || null,
+      doctorName: doctorName || 'Doctor',
+      email: email || '',
+      whatsapp: whatsapp || null,
+      city: city || '',
+      specialty: specialty || '',
+      budgetTier: budgetTier || 'Standard',
+      lang: lang || 'en',
+      createdAt: timestamp || new Date().toISOString()
+    };
+
+    console.log("[EXPERT AD SETUP LEAD RECEIVED]:", leadRecord);
+
+    // 1. Save locally to expert_leads.json
+    saveExpertLead(leadRecord);
+
+    // 2. Send instant response to client
+    res.json({ success: true, message: "Expert setup lead recorded" });
+
+    // 3. Background tasks: Resend email & Firestore backup
+    setImmediate(async () => {
+      sendExpertLeadEmail(leadRecord).catch(err => {
+        console.warn("Resend email delivery notice:", err.message);
+      });
+
+      if (admin && admin.firestore) {
+        try {
+          await admin.firestore().collection('expert_ad_requests').add(leadRecord);
+        } catch (e) {}
+      }
+    });
+  } catch (error) {
+    console.error("Expert ad request error:", error);
+    res.status(500).json({ error: error.message || "Internal server error" });
+  }
+});
+
+// ===== USER ISSUE REPORT ENDPOINT =====
+app.post('/api/report-issue', async (req, res) => {
+  try {
+    const { userId, userName, userRole, category, description, email, phone, lang, platform, userAgent, createdAt } = req.body;
+
+    if (!description || !email) {
+      return res.status(400).json({ error: "Missing required fields (description, email)" });
+    }
+
+    const reportRecord = {
+      id: 'iss_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+      userId: userId || 'anonymous',
+      userName: userName || 'User',
+      userRole: userRole || 'user',
+      category: category || 'Other',
+      description: description || '',
+      email: email || '',
+      phone: phone || null,
+      lang: lang || 'en',
+      platform: platform || 'Web App',
+      userAgent: userAgent || '',
+      createdAt: createdAt || new Date().toISOString()
+    };
+
+    console.log("[USER ISSUE REPORT RECEIVED]:", reportRecord);
+
+    // 1. Save locally to issue_reports.json
+    saveIssueReport(reportRecord);
+
+    // 2. Send instant response to client
+    res.json({ success: true, message: "Issue report received and recorded", id: reportRecord.id });
+
+    // 3. Background tasks: Resend email & Firestore backup
+    setImmediate(async () => {
+      sendIssueReportEmail(reportRecord).catch(err => {
+        console.warn("Resend email delivery notice:", err.message);
+      });
+
+      if (admin && admin.firestore) {
+        try {
+          await admin.firestore().collection('issue_reports').add(reportRecord);
+        } catch (e) {}
+      }
+    });
+  } catch (error) {
+    console.error("Issue report error:", error);
     res.status(500).json({ error: error.message || "Internal server error" });
   }
 });
